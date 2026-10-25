@@ -1,0 +1,108 @@
+name: Publish chart
+
+# Packages charts/itsaplan and pushes it to GHCR as an OCI artifact, so the chart
+# installs without cloning the repository:
+#
+#   helm install itsaplan oci://ghcr.io/<owner>/charts/itsaplan --version <appVersion>
+#
+# The chart version mirrors the app version (Chart.yaml `appVersion`, which
+# release-please bumps): a chart release always describes the images of the same
+# tag, and helm sees a new version instead of overwriting a fixed 0.1.0.
+#
+# Push a `chart-v<VERSION>` tag to publish from that ref; the manual trigger
+# publishes the Chart.yaml appVersion of the branch it runs on.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Chart version to publish. Empty publishes Chart.yaml appVersion (e.g. 1.8.0).
+        required: false
+        type: string
+  push:
+    tags: ['chart-v*']
+
+env:
+  REGISTRY: ghcr.io
+  CHART_DIR: charts/itsaplan
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Package and push to OCI
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # GITHUB_TOKEN may create the package even though the repository default is
+      # read-only, because this job asks for the permission explicitly.
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      - name: Resolve the version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          app_version=$(awk '/^appVersion:/ {gsub(/"/, "", $2); print $2}' "$CHART_DIR/Chart.yaml")
+
+          version="$INPUT_VERSION"
+          if [ -z "$version" ] && [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#chart-v}"
+          fi
+          if [ -z "$version" ]; then
+            version="$app_version"
+          fi
+
+          echo "app_version=$app_version" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Publishing chart $version (appVersion $app_version) from $GITHUB_REF."
+
+      - name: Lint
+        run: helm lint "$CHART_DIR"
+
+      # --version moves the chart version only; appVersion keeps pointing at the
+      # images the chart expects, which is what the deployments default to.
+      - name: Package
+        run: |
+          set -euo pipefail
+          helm package "$CHART_DIR" \
+            --version "${{ steps.version.outputs.version }}" \
+            --app-version "${{ steps.version.outputs.app_version }}" \
+            --destination dist
+          helm show chart "dist/itsaplan-${{ steps.version.outputs.version }}.tgz"
+
+      - name: Log in to the registry
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | helm registry login "$REGISTRY" --username "${{ github.actor }}" --password-stdin
+
+      - name: Push
+        id: push
+        run: |
+          set -euo pipefail
+          helm push "dist/itsaplan-${{ steps.version.outputs.version }}.tgz" \
+            "oci://$REGISTRY/${{ github.repository_owner }}/charts" | tee push.log
+          digest=$(awk '/^Digest:/ {print $2}' push.log)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "ref=oci://$REGISTRY/${{ github.repository_owner }}/charts/itsaplan:${{ steps.version.outputs.version }}" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Chart published"
+            echo
+            echo '```'
+            echo "helm install itsaplan ${{ steps.push.outputs.ref }} --version ${{ steps.version.outputs.version }}"
+            echo '```'
+            echo
+            echo "- digest: \`${{ steps.push.outputs.digest }}\`"
+            echo "- appVersion (default image tag): \`${{ steps.version.outputs.app_version }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
